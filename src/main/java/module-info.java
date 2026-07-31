@@ -10,4 +10,8 @@ module org.lostcitymapeditor {
     exports org.lostcitymapeditor.Renderer to javafx.graphics;
 
     exports org.lostcitymapeditor;
+    exports org.lostcitymapeditor.ipc;
+    exports org.lostcitymapeditor.ui;
+
+    opens org.lostcitymapeditor.ui to javafx.graphics;
 }

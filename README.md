@@ -27,9 +27,11 @@
 
 On first run you will be asked to select the **Server Data Source Directory** (game data with `pack/` and `maps/`).
 
-### macOS
+### macOS (dual-process)
 
-On macOS the app must run with the main thread as the first thread (for GLFW). To avoid relying on the directory chooser (which may not appear), pass the server path explicitly:
+On macOS, the editor automatically runs as **two JVM processes**: a GLFW renderer (with `-XstartOnFirstThread`) and a separate JavaFX config UI. This avoids the AppKit conflict that causes black screens when GLFW and JavaFX share a process.
+
+Pass the server path explicitly:
 
 ```bash
 ./gradlew run --args="/full/path/to/your/server"
@@ -37,7 +39,9 @@ On macOS the app must run with the main thread as the first thread (for GLFW). T
 
 Example: `./gradlew run --args="/Users/you/Documents/LostCity_Server/content"`
 
-If the config or map window does not appear, try **Cmd+Tab** to switch to the app and bring it to the front.
+The renderer and config windows will open separately. Closing the config window also stops the renderer.
+
+On Linux/Windows the editor runs in a single process by default. To force dual-process mode on any OS, add `-Deditor.dual=true`.
 
 ---
 
@@ -64,8 +68,6 @@ Ctrl + C to copy selected tile.
 Ctrl + V to paste copied tile on current selected tile.
 
 Ctrl + Z to undo
-
-For height values, 0 is perlin noise generated. 1 is floor height.
 
 ```
 export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home

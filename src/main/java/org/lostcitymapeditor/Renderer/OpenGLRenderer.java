@@ -1,36 +1,21 @@
 package org.lostcitymapeditor.Renderer;
 
 import javafx.application.Platform;
-import javafx.collections.FXCollections;
-import javafx.collections.ObservableList;
-import javafx.collections.transformation.FilteredList; //squid added
 import javafx.embed.swing.JFXPanel;
-import javafx.embed.swing.SwingNode;
-import javafx.geometry.Insets;
-import javafx.geometry.Pos;
-import javafx.scene.Scene;
-import javafx.scene.control.*;
-import javafx.scene.control.Button;
-import javafx.scene.control.Label;
-import javafx.scene.control.TextField;
-import javafx.scene.image.Image;
-import javafx.scene.image.ImageView;
-import javafx.scene.layout.*;
-import javafx.scene.paint.Color;
-import javafx.scene.shape.Rectangle;
 import org.joml.*;
 import org.lostcitymapeditor.DataObjects.*;
 import org.lostcitymapeditor.OriginalCode.*;
 import org.lostcitymapeditor.LostCityMapEditor;
 import org.lostcitymapeditor.Loaders.FileLoader;
 import org.lostcitymapeditor.Loaders.MapDataLoader;
-import org.lostcitymapeditor.Loaders.TextureLoader;
 import org.lostcitymapeditor.Transformers.MapDataTransformer;
-import org.lostcitymapeditor.Util.ModelViewerSelector;
+import org.lostcitymapeditor.ipc.IpcProtocol;
+import org.lostcitymapeditor.ipc.IpcServer;
+import org.lostcitymapeditor.ui.ConfigUI;
+import org.lostcitymapeditor.ui.EditorController;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.glfw.*;
 
-import java.awt.*;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -51,12 +36,9 @@ import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
@@ -81,27 +63,13 @@ public class OpenGLRenderer {
     private boolean firstMouse = true;
     private List<newTriangle> triangleList;
     private TileData selectedTile = null;
-    private JFXPanel fxPanel;
-    private ListView<Integer> shapeListView;
-    private CheckBox locCheckbox;
-    private CheckBox npcCheckbox;
-    private CheckBox objCheckbox;
-    private VBox tileInspector;
-    private VBox locInspector;
-    private VBox npcInspector;
-    private VBox objInspector;
-    private Label inspectorTitle;
-    private Label locPositionLabel;
-    private Label npcPositionLabel;
-    private Label objPositionLabel;
-    private TextField newHeightTextField;
-    private TextField objAmountTextField;
+
     public static String currentMapFileName = "m50_50.jm2";
     public static Map<String, Integer> underlayMap;
     public static Map<String, Object> overlayMap;
     public static Map<String, Object> npcMap;
     public static Map<String, Object> objMap;
-    public static Map<Integer, Image> shapeImages;
+    public static Map<Integer, javafx.scene.image.Image> shapeImages;
     public static int currentLevel = 0;
     private static MapData currentMapData;
     public static World world;
@@ -109,37 +77,45 @@ public class OpenGLRenderer {
     public static OpenGLRenderer renderer;
     private final BlockingQueue<Runnable> glQueue = new LinkedBlockingQueue<>();
     public static int[] distance;
+
+    // Tile-editing state (set by ConfigUI or IPC)
     public static Integer selectedOverlayID = 0;
     public static Integer selectedUnderlayID = 0;
     public static Integer selectedShape = -1;
     public static Integer selectedFlag = -1;
-    public static Label currentMapLabel;
-    private Label tilePositionLabel;
-    private Label tileOverlayLabel;
-    private Label tileUnderlayLabel;
-    private Label tileHeightLabel;
-    private Label tileFlagLabel;
-    private Label tileShapeLabel;
-    private Label tileRotationLabel;
-    private Label tileTextureLabel;
-    private Label locDetailsLabel;
-    private Label objDetailsLabel;
-    private Label npcDetailsLabel;
+    private int selectedRotation = -1;
+    private String heightText = "";
+
+    // Loc placement state
+    private String selectedLocName;
+    private int selectedLocRotation = 0;
+    private int selectedLocShape = 10;
+
+    // NPC/OBJ placement state
+    private int selectedNpcId = -1;
+    private int selectedObjId = -1;
+    private int selectedObjAmount = 1;
+
+    // Display flags
+    private boolean displayLocs = true;
+    private boolean displayNpcs = true;
+    private boolean displayObjs = true;
+
     private Set<Integer> hoveredTileTriangleIndices = new HashSet<>();
     private final TextureManager textureManager = new TextureManager();
     private VertexDataHandler vertexDataHandler = new VertexDataHandler();
-    private ModelViewer modelViewer;
-    private ModelViewerSelector modelViewerSelector;
-    private int selectedRotation = -1;
-    private int selectedLocRotation;
-    private int selectedLocShape = 10;
-    private int selectedNpcId = -1;
-    private int selectedObjId = -1;
     private static String serverDirectoryPath;
     private CopiedTileData copiedTileData = null;
     private final Deque<MapData> historyStack = new ArrayDeque<>();
     private static final int MAX_HISTORY_SIZE = 30;
     private int isHoveredVBO = -1;
+
+    // Dual-process / IPC state
+    private boolean ipcMode = false;
+    private int ipcPort = -1;
+    private IpcServer ipcServer;
+    private boolean fxAvailable = false;
+    private ConfigUI configUI;
 
     private void updateHoveredTriangle(double mouseX, double mouseY) {
         hoveredTileTriangleIndices.clear();
@@ -187,14 +163,6 @@ public class OpenGLRenderer {
 
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
-    }
-
-    private void updateCurrentMapLabel(String mapFileName) {
-        Platform.runLater(() -> {
-            if (currentMapLabel != null) {
-                currentMapLabel.setText("Current Map: " + mapFileName);
-            }
-        });
     }
 
     public void drawMapLevel() {
@@ -289,19 +257,19 @@ public class OpenGLRenderer {
         return null;
     }
 
-    public void drawNewMap(MapData currentMapData) {
+    public void drawNewMap(MapData mapData) {
         enqueueGLTask(() -> {
             world = new World(REGION_SIZE, REGION_SIZE);
-            world.loadGround(currentMapData);
+            world.loadGround(mapData);
             world3D = new World3D(world.levelHeightmap, REGION_SIZE, LEVELS, REGION_SIZE);
-            if(locCheckbox.isSelected()) {
-                world.loadLocations(world3D, currentMapData);
+            if (displayLocs) {
+                world.loadLocations(world3D, mapData);
             }
-            if(npcCheckbox.isSelected()) {
-                world.loadNpcs(world3D, currentMapData);
+            if (displayNpcs) {
+                world.loadNpcs(world3D, mapData);
             }
-            if(objCheckbox.isSelected()) {
-                world.loadObjs(world3D, currentMapData);
+            if (displayObjs) {
+                world.loadObjs(world3D, mapData);
             }
             world.build(world3D);
             newTriangle.clearCollectedTriangles();
@@ -316,926 +284,208 @@ public class OpenGLRenderer {
         glQueue.add(task);
     }
 
-    public void setupJavaFXUI() {
-        modelViewer = new ModelViewer(300, 350);
-        JFrame frame = new JFrame("LostCity Map Editor Config");
-        fxPanel = new JFXPanel();
-        frame.add(fxPanel);
-        frame.setSize(1100, 900);
-        frame.setAlwaysOnTop(true);
-        frame.setVisible(true);
-        frame.toFront();
-        frame.requestFocus();
-        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        // Stop always-on-top after a short delay so the window can be moved behind others
-        javax.swing.Timer t = new javax.swing.Timer(500, e -> frame.setAlwaysOnTop(false));
-        t.setRepeats(false);
-        t.start();
+    // --- Tile info formatting for ConfigUI / IPC ---
 
-        Platform.runLater(() -> {
-            ObservableList<String> mapFiles = MapDataLoader.getJM2Files(serverDirectoryPath + "/maps/");
-            ListView<String> mapListView = new ListView<>(mapFiles);
-            mapListView.setPrefWidth(150);
-
-            ObservableList<String> underlayNames = FXCollections.observableArrayList(underlayMap.keySet());
-            underlayNames.addFirst("Original");
-            underlayNames.add(1, "Clear");
-
-            ObservableList<String> overlayNames = FXCollections.observableArrayList(overlayMap.keySet());
-            overlayNames.addFirst("Original");
-            overlayNames.add(1, "Clear");
-
-            ListView<String>overlayListView = new ListView<>(overlayNames);
-            overlayListView.setPrefHeight(50);
-            overlayListView.setCellFactory(param -> new ListCell<>() {
-                private final Rectangle rect = new Rectangle(20, 20);
-                private final ImageView textureView = new ImageView();
-
-                @Override
-                protected void updateItem(String item, boolean empty) {
-                    super.updateItem(item, empty);
-                    if (empty || item == null) {
-                        setText(null);
-                        setGraphic(null);
-                    } else {
-                        setText(item);
-                        Map<String, Object> overlayData = (Map<String, Object>) overlayMap.get(item);
-                        if (overlayData != null) {
-                            if (overlayData.containsKey("rgb")) {
-                                Integer color = (Integer) overlayData.get("rgb");
-                                if (color != null) {
-                                    rect.setFill(Color.rgb((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF));
-                                    setGraphic(rect);
-                                } else {
-                                    rect.setFill(Color.TRANSPARENT);
-                                    setGraphic(null);
-                                }
-                            } else if (overlayData.containsKey("texture")) {
-                                String textureName = (String) overlayData.get("texture");
-                                Image texture = TextureLoader.loadTextureImage(serverDirectoryPath, textureName);
-                                if (texture != null) {
-                                    textureView.setImage(texture);
-                                    textureView.setFitWidth(20);
-                                    textureView.setFitHeight(20);
-                                    setGraphic(textureView);
-                                } else {
-                                    setGraphic(null);
-                                }
-                            } else {
-                                setGraphic(null);
-                            }
-                        } else {
-                            setGraphic(null);
-                        }
-                    }
-                }
-            });
-
-            overlayListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue == null || newValue.equals("Original")) {
-                            selectedOverlayID = 0;
-                        } else if (newValue.equals("Clear")) {
-                            selectedOverlayID = -1;
-                        } else {
-                            selectedOverlayID = findOverlayOrUnderlayIdByName(newValue);
-                        }
-                    }
-            );
-
-
-            ObservableList<Integer> shapeValues = FXCollections.observableArrayList(IntStream.range(0, 12).boxed().collect(Collectors.toList()));
-            shapeListView = new ListView<>(shapeValues);
-            shapeListView.setPrefWidth(250);
-            shapeListView.setPrefHeight(150);
-            String[] shapeNames = TileOverlay.SHAPE_NAMES;
-
-            shapeListView.setCellFactory(param -> new ListCell<>() {
-                private final ImageView imageView = new ImageView();
-
-                {
-                    imageView.setFitWidth(50);
-                    imageView.setFitHeight(50);
-                }
-
-                @Override
-                protected void updateItem(Integer item, boolean empty) {
-                    super.updateItem(item, empty);
-
-                    if (empty || item == null) {
-                        setText(null);
-                        setGraphic(null);
-                    } else {
-                        Image image = shapeImages.get(item);
-                        String shapeName = (item >= 0 && item < shapeNames.length) ? shapeNames[item] : "Unknown";
-                        if (image != null) {
-                            imageView.setImage(image);
-                            setText(item + " - " + shapeName);
-                            setGraphic(imageView);
-                        } else {
-                            setText(item + " - " + shapeName);
-                            setGraphic(null);
-                        }
-                    }
-                }
-            });
-
-            shapeListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue != null) {
-                            selectedShape = newValue;
-                        }
-                    });
-
-            ObservableList<Integer> flagValues = FXCollections.observableArrayList(0, 1, 2, 4, 8, 16);
-            ListView<Integer>flagListView = new ListView<>(flagValues);
-            flagListView.setPrefWidth(250);
-            flagListView.setPrefHeight(150);
-
-            flagListView.setCellFactory(param -> new ListCell<>() {
-                @Override
-                protected void updateItem(Integer item, boolean empty) {
-                    super.updateItem(item, empty);
-
-                    if (empty || item == null) {
-                        setText(null);
-                    } else {
-                        String description = switch (item) {
-                            case 0 -> "None";
-                            case 1 -> "Unwalkable";
-                            case 2 -> "Bridge";
-                            case 4 -> "Remove roof";
-                            case 8 -> "Render on level below";
-                            case 16 -> "Don't draw on map";
-                            default -> "";
-                        };
-                        setText(item + " - " + description);
-                    }
-                }
-            });
-
-            flagListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue != null) {
-                            selectedFlag = newValue;
-                        }
-                    });
-
-            Label currentLevelLabel = new Label("Current Level:");
-            ToggleGroup levelToggleGroup = new ToggleGroup();
-            VBox levelRadioButtons = new VBox(5);
-            for (int i = 0; i < LEVELS; i++) {
-                RadioButton levelButton = new RadioButton("Level " + i);
-                levelButton.setToggleGroup(levelToggleGroup);
-                levelButton.setUserData(i);
-                levelRadioButtons.getChildren().add(levelButton);
-
-                int level = i;
-                levelButton.setOnAction(e -> {
-                    currentLevel = level;
-                    if (currentMapData != null) {
-                        historyStack.clear();
-                        drawMapLevel();
-                    }
-                });
-            }
-            ((RadioButton) levelRadioButtons.getChildren().get(0)).setSelected(true);
-
-            Label displayLabel = new Label("Display:");
-            locCheckbox = new CheckBox("Locs");
-            locCheckbox.setSelected(true);
-            npcCheckbox = new CheckBox("Npcs");
-            npcCheckbox.setSelected(true);
-            objCheckbox = new CheckBox("Objs");
-            objCheckbox.setSelected(true);
-
-            Button exportButton = new Button("Export Map");
-
-            locInspector = new VBox();
-            locInspector.setPadding(new Insets(10));
-            locInspector.setBorder(new Border(new BorderStroke(Color.BLACK, BorderStrokeStyle.SOLID, CornerRadii.EMPTY, BorderWidths.DEFAULT)));
-            locInspector.setPrefWidth(250);
-
-            Label newLocRotationLabel = new Label("New Loc Rotation");
-            VBox locRotationBox = new VBox(5);
-            ToggleGroup locRotationGroup = new ToggleGroup();
-
-            Integer[] rotations = {0, 90, 180, 270};
-            for (Integer rotation : rotations) {
-                RadioButton rb = new RadioButton(rotation.toString());
-                rb.setToggleGroup(locRotationGroup);
-                rb.setUserData(rotation);
-                locRotationBox.getChildren().add(rb);
-            }
-
-            locRotationGroup.selectedToggleProperty().addListener((observable, oldValue, newValue) -> {
-                if (newValue != null) {
-                    selectedLocRotation = (Integer) newValue.getUserData();
-                }
-            });
-
-            Label newLocShapeLabel = new Label("New Loc Shape");
-            ObservableList<Integer> locShapeValues = FXCollections.observableArrayList();
-            for (int i = 0; i <= 22; i++) {
-                locShapeValues.add(i);
-            }
-
-            ListView<Integer>locShapeListView = new ListView<>(locShapeValues);
-            locShapeListView.setPrefWidth(100);
-            locShapeListView.setPrefHeight(100);
-
-            String[] locShapeNames = new String[]{
-                    "Wall Straight", "Wall Diagonal Corner", "Wall L", "Wall Square Corner",
-                    "Wall Decor Straight No Offset", "Wall Decor Straight Offset", "Wall Decor Diagonal Offset",
-                    "Wall Decor Diagonal No Offset", "Wall Decor Diagonal Both", "Wall Diagonal",
-                    "Centrepiece Straight", "Centrepiece Diagonal", "Roof Straight",
-                    "Roof Diagonal With Roof Edge", "Roof Diagonal", "Roof L Concave", "Roof L Convex",
-                    "Roof Flat", "Roof Edge Straight", "Roof Edge Diagonal Corner", "Roof Edge L",
-                    "Roof Edge Square Corner", "Ground Decor"
-            };
-
-            locShapeListView.setCellFactory(param -> new ListCell<>() {
-                @Override
-                protected void updateItem(Integer item, boolean empty) {
-                    super.updateItem(item, empty);
-                    if (empty || item == null) {
-                        setText(null);
-                    } else {
-                        String shapeName = (item >= 0 && item < locShapeNames.length) ? locShapeNames[item] : "Unknown";
-                        setText(item + " - " + shapeName);
-                    }
-                }
-            });
-
-
-            locShapeListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue != null) {
-                            selectedLocShape = newValue;
-                            modelViewerSelector.updateModel(selectedLocShape);
-                        }
-                    });
-
-            inspectorTitle = new Label("--Locs--\nLeft Click to inspect\nL + click to update");
-            locPositionLabel = new Label("Position: ");
-            locDetailsLabel = new Label();
-            Button clearLocsButton = new Button("Clear Tile Locs");
-            clearLocsButton.setOnAction(e -> {
-                if (selectedTile != null) {
-                    saveStateBeforeChange();
-                    Platform.runLater(() -> {
-                        currentMapData.removeLocData(selectedTile.level, selectedTile.x, selectedTile.z);
-                        drawNewMap(currentMapData);
-                        updateLocInspector();
-                    });
-                }
-            });
-
-            locInspector.getChildren().addAll(inspectorTitle, locPositionLabel, locDetailsLabel, clearLocsButton, newLocRotationLabel, locRotationBox, newLocShapeLabel, locShapeListView);
-
-            npcInspector = new VBox();
-            npcInspector.setPadding(new Insets(10));
-            npcInspector.setBorder(new Border(new BorderStroke(Color.BLACK, BorderStrokeStyle.SOLID, CornerRadii.EMPTY, BorderWidths.DEFAULT)));
-            npcInspector.setPrefWidth(250);
-
-            inspectorTitle = new Label("--Npcs--\nLeft Click to inspect\nN + Click to update");
-            npcPositionLabel = new Label("Position: ");
-            npcDetailsLabel = new Label();
-            Button clearNpcsButton = new Button("Clear Tile Npcs");
-            clearNpcsButton.setOnAction(e -> {
-                if (selectedTile != null) {
-                    saveStateBeforeChange();
-                    Platform.runLater(() -> {
-                        currentMapData.removeNpcData(selectedTile.level, selectedTile.x, selectedTile.z);
-                        drawNewMap(currentMapData);
-                        updateNpcInspector();
-                    });
-                }
-            });
-
-            /* NPC SELECTOR BEGIN */
-
-            /*Set<String> npcNameSet = npcMap.keySet();
-
-            List<String> sortedNpcNames = new ArrayList<>(npcNameSet);
-            Collections.sort(sortedNpcNames);
-            ObservableList<String> npcNamesObservable = FXCollections.observableArrayList(sortedNpcNames);
-
-            npcNamesObservable.addFirst("None");
-
-            ListView<String> npcListView = new ListView<>(npcNamesObservable);
-            npcListView.setPrefHeight(150);
-
-            npcListView.setCellFactory(param -> new ListCell<String>() {
-                @Override
-                protected void updateItem(String npcName, boolean empty) {
-                    super.updateItem(npcName, empty);
-                    if (empty || npcName == null) {
-                        setText(null);
-                        setGraphic(null);
-                    } else {
-                        setText(npcName);
-                        setGraphic(null);
-                    }
-                }
-            });
-
-            npcListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue == null || newValue.equals("None")) {
-                            selectedNpcId = -1;
-                        } else {
-                            int npcId = -1;
-                            for (Integer id : FileLoader.getNpcMap().keySet()) {
-                                if (FileLoader.getNpcMap().get(id).equals(newValue)) {
-                                    npcId = id;
-                                    break;
-                                }
-                            }
-                            if (npcId == -1) {
-                                System.err.println("Error: Could not find NPC data or ID key for selected item '" + newValue + "'.");
-                            }
-                            selectedNpcId = npcId;
-                        }
-                    }
-            );
-
-            npcListView.getSelectionModel().select("None");
-
-            npcInspector.getChildren().addAll(inspectorTitle, npcPositionLabel, npcDetailsLabel, clearNpcsButton, npcListView);
-            */
-            Set<String> npcNameSet = npcMap.keySet();
-
-            List<String> sortedNpcNames = new ArrayList<>(npcNameSet);
-            Collections.sort(sortedNpcNames);
-            ObservableList<String> npcNamesObservable = FXCollections.observableArrayList(sortedNpcNames);
-
-            // IMPORTANT: ObservableList in JavaFX does not consistently support addFirst(); use add(0, ...)
-            npcNamesObservable.add(0, "None");
-
-            // Wrap in FilteredList so we can filter by a search query
-            FilteredList<String> npcFilteredList = new FilteredList<>(npcNamesObservable, s -> true);
-
-            // Search box
-            TextField npcSearchField = new TextField();
-            npcSearchField.setPromptText("Search NPCs...");
-            npcSearchField.textProperty().addListener((obs, oldValue, newValue) -> {
-                final String query = (newValue == null) ? "" : newValue.trim().toLowerCase();
-                npcFilteredList.setPredicate(item -> {
-                    if (item == null) return false;
-                    if ("None".equals(item)) return true;         // keep "None" visible during search
-                    if (query.isEmpty()) return true;
-                    return item.toLowerCase().contains(query);
-                });
-            });
-
-            ListView<String> npcListView = new ListView<>(npcFilteredList);
-            npcListView.setPrefHeight(150);
-
-            npcListView.setCellFactory(param -> new ListCell<String>() {
-                @Override
-                protected void updateItem(String npcName, boolean empty) {
-                    super.updateItem(npcName, empty);
-                    if (empty || npcName == null) {
-                        setText(null);
-                        setGraphic(null);
-                    } else {
-                        setText(npcName);
-                        setGraphic(null);
-                    }
-                }
-            });
-
-            npcListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue == null || newValue.equals("None")) {
-                            selectedNpcId = -1;
-                        } else {
-                            int npcId = -1;
-                            for (Integer id : FileLoader.getNpcMap().keySet()) {
-                                if (FileLoader.getNpcMap().get(id).equals(newValue)) {
-                                    npcId = id;
-                                    break;
-                                }
-                            }
-                            if (npcId == -1) {
-                                System.err.println("Error: Could not find NPC data or ID key for selected item '" + newValue + "'.");
-                            }
-                            selectedNpcId = npcId;
-                        }
-                    }
-            );
-
-            npcListView.getSelectionModel().select("None");
-
-            // Add the search field above the list view (this is the functional UI change)
-            npcInspector.getChildren().addAll(
-                    inspectorTitle,
-                    npcPositionLabel,
-                    npcDetailsLabel,
-                    clearNpcsButton,
-                    npcSearchField,
-                    npcListView
-            );
-
-
-            /* OBJ SELECTOR BEGIN */
-
-            objInspector = new VBox();
-            objInspector.setPadding(new Insets(10));
-            objInspector.setBorder(new Border(new BorderStroke(Color.BLACK, BorderStrokeStyle.SOLID, CornerRadii.EMPTY, BorderWidths.DEFAULT)));
-            objInspector.setPrefWidth(250);
-
-            inspectorTitle = new Label("--Objs--\nLeft Click to inspect\nO + Click to update");
-            objPositionLabel = new Label("Position: ");
-            objDetailsLabel = new Label();
-            Button clearObjsButton = new Button("Clear Tile Objs");
-            clearObjsButton.setOnAction(e -> {
-                if (selectedTile != null) {
-                    saveStateBeforeChange();
-                    Platform.runLater(() -> {
-                        currentMapData.removeObjData(selectedTile.level, selectedTile.x, selectedTile.z);
-                        drawNewMap(currentMapData);
-                        updateObjInspector();
-                    });
-                }
-            });
-
-            Set<String> objNameSet = objMap.keySet();
-
-            List<String> sortedObjNames = new ArrayList<>(objNameSet);
-            Collections.sort(sortedObjNames);
-            ObservableList<String> objNamesObservable = FXCollections.observableArrayList(sortedObjNames);
-
-            // IMPORTANT: ObservableList in JavaFX does not consistently support addFirst(); use add(0, ...)
-            objNamesObservable.add(0, "None");
-
-            // Wrap in FilteredList so we can filter by a search query
-            FilteredList<String> objFilteredList = new FilteredList<>(objNamesObservable, s -> true);
-
-            // Search box
-            TextField objSearchField = new TextField();
-            objSearchField.setPromptText("Search OBJs...");
-            objSearchField.textProperty().addListener((obs, oldValue, newValue) -> {
-                final String query = (newValue == null) ? "" : newValue.trim().toLowerCase();
-                objFilteredList.setPredicate(item -> {
-                    if (item == null) return false;
-                    if ("None".equals(item)) return true;         // keep "None" visible during search
-                    if (query.isEmpty()) return true;
-                    return item.toLowerCase().contains(query);
-                });
-            });
-
-            ListView<String> objListView = new ListView<>(objFilteredList);
-            objListView.setPrefHeight(150);
-
-            objListView.setCellFactory(param -> new ListCell<String>() {
-                @Override
-                protected void updateItem(String objName, boolean empty) {
-                    super.updateItem(objName, empty);
-                    if (empty || objName == null) {
-                        setText(null);
-                        setGraphic(null);
-                    } else {
-                        setText(objName);
-                        setGraphic(null);
-                    }
-                }
-            });
-
-            objListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue == null || newValue.equals("None")) {
-                            selectedObjId = -1;
-                        } else {
-                            int objId = -1;
-                            for (Integer id : FileLoader.getObjMap().keySet()) {
-                                if (FileLoader.getObjMap().get(id).equals(newValue)) {
-                                    objId = id;
-                                    break;
-                                }
-                            }
-                            if (objId == -1) {
-                                System.err.println("Error: Could not find OBJ data or ID key for selected item '" + newValue + "'.");
-                            }
-                            selectedObjId = objId;
-                        }
-                    }
-            );
-
-            objListView.getSelectionModel().select("None");
-
-            Label objAmountLabel = new Label("Amount:");
-            objAmountTextField = new TextField();
-
-            // Add the search field above the list view (this is the functional UI change)
-            objInspector.getChildren().addAll(
-                    inspectorTitle,
-                    objPositionLabel,
-                    objDetailsLabel,
-                    clearObjsButton,
-                    objSearchField,
-                    objListView,
-                    objAmountLabel,
-                    objAmountTextField
-            );
-
-            /* BEGIN TILE INSPECTOR*/
-
-
-            tileInspector = new VBox();
-            tileInspector.setPadding(new Insets(10));
-            tileInspector.setBorder(new Border(new BorderStroke(Color.BLACK, BorderStrokeStyle.SOLID, CornerRadii.EMPTY, BorderWidths.DEFAULT)));
-            tileInspector.setPrefWidth(250);
-
-            Label inspectorTitle = new Label("--Tiles--\nLeft Click to inspect\nCtrl + Click to update");
-            Label currentUnderlayLabel = new Label("New Underlay");
-            ListView<String> underlayListView = new ListView<>(underlayNames);
-            underlayListView.setPrefHeight(50);
-            underlayListView.setCellFactory(param -> new ListCell<>() {
-                private final Rectangle rect = new Rectangle(20, 20);
-
-                @Override
-                protected void updateItem(String item, boolean empty) {
-                    super.updateItem(item, empty);
-                    if (empty || item == null) {
-                        setText(null);
-                        setGraphic(null);
-                    } else {
-                        setText(item);
-                        Integer color = underlayMap.get(item);
-                        if (color != null) {
-                            rect.setFill(Color.rgb((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF));
-                            setGraphic(rect);
-                        } else {
-                            rect.setFill(Color.TRANSPARENT);
-                            setGraphic(null);
-                        }
-                    }
-                }
-            });
-
-            underlayListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue == null || newValue.equals("Original")) {
-                            selectedUnderlayID = 0;
-                        } else if (newValue.equals("Clear")) {
-                            selectedUnderlayID = -1;
-                        } else {
-                            selectedUnderlayID = findOverlayOrUnderlayIdByName(newValue);
-                        }
-                    }
-            );
-
-            Label currentOverlayLabel = new Label("New Overlay");
-            Label newHeightLabel = new Label("New Height");
-            Label newFlagLabel = new Label("New Flag");
-            Label newShapeLabel = new Label("New Shape");
-            Label newRotationLabel = new Label("New Rotation");
-            VBox rotationBox = new VBox(5);
-            ToggleGroup rotationGroup = new ToggleGroup();
-
-            for (Integer rotation : rotations) {
-                RadioButton rb = new RadioButton(rotation.toString());
-                rb.setToggleGroup(rotationGroup);
-                rb.setUserData(rotation);
-                rotationBox.getChildren().add(rb);
-            }
-
-            rotationGroup.selectedToggleProperty().addListener((observable, oldValue, newValue) -> {
-                if (newValue != null) {
-                    selectedRotation = (Integer) newValue.getUserData();
-                }
-            });
-
-            newHeightTextField = new TextField();
-
-            tilePositionLabel = new Label("Position: ");
-            tileOverlayLabel = new Label("Overlay ID: ");
-            tileUnderlayLabel = new Label("Underlay ID: ");
-            tileFlagLabel = new Label("Flag ID: ");
-            tileHeightLabel = new Label("Height: ");
-            tileShapeLabel = new Label("Shape ID: ");
-            tileRotationLabel = new Label("Shape Rotation: ");
-            tileTextureLabel = new Label("Texture Name: ");
-
-            tileInspector.getChildren().addAll(
-                    inspectorTitle,
-                    tilePositionLabel,
-                    tileOverlayLabel,
-                    tileUnderlayLabel,
-                    tileFlagLabel,
-                    tileHeightLabel,
-                    tileShapeLabel,
-                    tileRotationLabel,
-                    tileTextureLabel,
-                    currentUnderlayLabel, underlayListView,
-                    currentOverlayLabel, overlayListView,
-                    newHeightLabel, newHeightTextField,
-                    newFlagLabel, flagListView,
-                    newRotationLabel, rotationBox,
-                    newShapeLabel, shapeListView
-            );
-
-            VBox controlsBox = new VBox(
-                    currentLevelLabel, levelRadioButtons,
-                    displayLabel,
-                    locCheckbox,
-                    npcCheckbox,
-                    objCheckbox,
-                    exportButton
-            );
-            controlsBox.setPadding(new Insets(0));
-            currentMapLabel = new Label("Current Map: " + currentMapFileName);
-            VBox sideBar = new VBox(currentMapLabel, mapListView, controlsBox);
-            BorderPane.setMargin(controlsBox, new Insets(10, 0, 10, 0));
-            sideBar.setPadding(new Insets(10));
-            sideBar.setBorder(new Border(new BorderStroke(Color.BLACK, BorderStrokeStyle.SOLID, CornerRadii.EMPTY, BorderWidths.DEFAULT)));
-            modelViewerSelector = new ModelViewerSelector(modelViewer);
-
-            modelViewerSelector.getModelListView().getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue != null) {
-                            List<Integer> viable = FileLoader.getViableShapesForLoc(newValue);
-
-                            Platform.runLater(() -> {
-                                locShapeValues.clear();
-                                locShapeValues.addAll(viable);
-
-                                if (!viable.isEmpty()) {
-                                    if (viable.contains(10)) {
-                                        locShapeListView.getSelectionModel().select(Integer.valueOf(10));
-                                        selectedLocShape = 10;
-                                    } else {
-                                        locShapeListView.getSelectionModel().select(0);
-                                        selectedLocShape = viable.get(0);
-                                    }
-
-                                    modelViewerSelector.updateModel(selectedLocShape);
-                                }
-                            });
-                        }
-                    }
-            );
-
-            SwingNode modelViewerSwingNode = new SwingNode();
-            Platform.runLater(() -> modelViewerSwingNode.setContent(modelViewer));
-            VBox.setVgrow(modelViewerSwingNode, Priority.ALWAYS);
-            VBox modelViewerBox = new VBox();
-            modelViewerBox.setPadding(new Insets(10));
-            modelViewerBox.setAlignment(Pos.CENTER);
-            modelViewerBox.setBorder(new Border(new BorderStroke(Color.BLACK, BorderStrokeStyle.SOLID, CornerRadii.EMPTY, BorderWidths.DEFAULT)));
-            modelViewerBox.setPrefWidth(250);
-            modelViewerBox.getChildren().addAll(modelViewerSelector, modelViewerSwingNode);
-            HBox mainContent = new HBox(tileInspector, locInspector, modelViewerBox, npcInspector, objInspector);
-
-            BorderPane rootPane = new BorderPane();
-            rootPane.setLeft(sideBar);
-            rootPane.setCenter(mainContent);
-
-            Scene scene = new Scene(rootPane, 800, 600);
-            fxPanel.setScene(scene);
-
-            mapListView.getSelectionModel().selectedItemProperty().addListener(
-                    (observable, oldValue, newValue) -> {
-                        if (newValue != null) {
-                            currentMapFileName = newValue;
-                            updateCurrentMapLabel(currentMapFileName);
-                            currentMapData = MapDataTransformer.parseJM2File(serverDirectoryPath + "/maps/" + currentMapFileName);
-
-                            historyStack.clear();
-
-                            Platform.runLater(() -> {
-                                drawNewMap(currentMapData);
-                                selectedTile = null;
-                                updateTileInspector();
-                                updateLocInspector();
-                                updateNpcInspector();
-                                updateObjInspector();
-                            });
-                        }
-                    }
-            );
-
-            locCheckbox.setOnAction(e -> {
-                if (currentMapData != null) {
-                    Platform.runLater(() -> {
-                        drawNewMap(currentMapData);
-                    });
-                }
-            });
-
-            npcCheckbox.setOnAction(e -> {
-                if (currentMapData != null) {
-                    Platform.runLater(() -> {
-                        drawNewMap(currentMapData);
-                    });
-                }
-            });
-
-            objCheckbox.setOnAction(e -> {
-                if (currentMapData != null) {
-                    Platform.runLater(() -> {
-                        drawNewMap(currentMapData);
-                    });
-                }
-            });
-
-            exportButton.setOnAction(e -> {
-                MapDataLoader.exportMap(currentMapData, currentMapFileName, serverDirectoryPath);
-            });
-        });
+    private String formatTilePosition(TileData tile) {
+        return String.format("Position: X=%d, Z=%d Level=%d", tile.x, tile.z, tile.level);
     }
 
-    private void updateTileInspector() {
-        Platform.runLater(() -> {
-            if (selectedTile != null) {
-                tilePositionLabel.setText(String.format("Position: X=%d, Z=%d Level=%d",
-                        selectedTile.x,
-                        selectedTile.z,
-                        selectedTile.level));
-
-                String overlayText = "Overlay ID: ";
-                if (selectedTile.overlay == null) {
-                    overlayText += "None";
-                } else {
-                    String overlayName = FileLoader.getFloMap().get(selectedTile.overlay.id);
-                    overlayText += selectedTile.overlay.id;
-                    if (overlayName != null) {
-                        overlayText += " - " + overlayName;
-                    }
-                }
-                tileOverlayLabel.setText(overlayText);
-
-                String underlayText = "Underlay ID: ";
-                if (selectedTile.underlay == null) {
-                    underlayText += "None";
-                } else {
-                    String underlayName = FileLoader.getFloMap().get(selectedTile.underlay.id);
-                    underlayText += selectedTile.underlay.id;
-                    if (underlayName != null) {
-                        underlayText += " - " + underlayName;
-                    }
-                }
-                tileUnderlayLabel.setText(underlayText);
-
-                if (selectedTile.perlin && selectedTile.level == 0) {
-                    tileHeightLabel.setText("Height: Perlin Generated");
-                } else {
-                    tileHeightLabel.setText(String.format("Height: %d",
-                            (selectedTile.height / -8)));
-                }
-                tileFlagLabel.setText("Flag ID: " + (selectedTile.flag != null ?
-                        selectedTile.flag : "None"));
-
-                tileShapeLabel.setText("Shape ID: " + (selectedTile.shape != null ? selectedTile.shape : 0));
-
-                tileRotationLabel.setText("Shape Rotation: " + (selectedTile.rotation != null ? selectedTile.rotation * 90 : 0));
-
-                tileTextureLabel.setText("Texture Name: " + (selectedTile.overlay != null && selectedTile.overlay.texture != null ?
-                        selectedTile.overlay.texture : "None"));
-            } else {
-                tilePositionLabel.setText("Position: ");
-                tileOverlayLabel.setText("Overlay ID: ");
-                tileUnderlayLabel.setText("Underlay ID: ");
-                tileHeightLabel.setText("Height: ");
-                tileShapeLabel.setText("Shape ID: ");
-                tileRotationLabel.setText("Shape Rotation: ");
-                tileTextureLabel.setText("Texture Name: ");
-            }
-        });
+    private String formatTileOverlay(TileData tile) {
+        if (tile.overlay == null) return "Overlay ID: None";
+        String overlayName = FileLoader.getFloMap().get(tile.overlay.id);
+        String text = "Overlay ID: " + tile.overlay.id;
+        if (overlayName != null) text += " - " + overlayName;
+        return text;
     }
 
-    public void updateLocInspector() {
-        Platform.runLater(() -> {
-            if (selectedTile != null) {
-                locPositionLabel.setText(String.format("Position: X=%d, Z=%d Level=%d",
-                        selectedTile.x,
-                        selectedTile.z,
-                        selectedTile.level));
-                List<LocData> currentLocs = currentMapData.getLocData(selectedTile.level, selectedTile.x,selectedTile.z);
-
-                StringBuilder details = new StringBuilder();
-                details.append(String.format("--------------------%n"));
-                if (!currentLocs.isEmpty()) {
-                    for (int i = 0; i < currentLocs.size(); i++) {
-                        LocData loc = currentLocs.get(i);
-                        details.append(String.format("Name: %s%nID: %d%nShape: %d%nRotation: %s%n", FileLoader.getLocMap().get(loc.id), loc.id, loc.shape, loc.rotation * 90));
-                        if (i < currentLocs.size() - 1) {
-                            details.append(String.format("--------------------%n"));
-                        }
-                    }
-                } else {
-                    details.append("No LocData found for this tile.");
-                }
-                locDetailsLabel.setText(details.toString());
-            }
-        });
+    private String formatTileUnderlay(TileData tile) {
+        if (tile.underlay == null) return "Underlay ID: None";
+        String underlayName = FileLoader.getFloMap().get(tile.underlay.id);
+        String text = "Underlay ID: " + tile.underlay.id;
+        if (underlayName != null) text += " - " + underlayName;
+        return text;
     }
 
-    public void updateNpcInspector() {
-        Platform.runLater(() -> {
-            if (selectedTile != null) {
-                npcPositionLabel.setText(String.format("Position: X=%d, Z=%d Level=%d",
-                        selectedTile.x,
-                        selectedTile.z,
-                        selectedTile.level));
-                List<NpcData> currentNpcs = currentMapData.getNpcData(selectedTile.level, selectedTile.x,selectedTile.z);
-
-                StringBuilder details = new StringBuilder();
-                details.append(String.format("--------------------%n"));
-                if (!currentNpcs.isEmpty()) {
-                    for (int i = 0; i < currentNpcs.size(); i++) {
-                        NpcData npc = currentNpcs.get(i);
-                        details.append(String.format("Name: %s%nID: %d%n", FileLoader.getNpcMap().get(npc.id), npc.id));
-                        if (i < currentNpcs.size() - 1) {
-                            details.append(String.format("--------------------%n"));
-                        }
-                    }
-                } else {
-                    details.append("No NpcData found for this tile.");
-                }
-                npcDetailsLabel.setText(details.toString());
-            }
-        });
+    private String formatTileHeight(TileData tile) {
+        if (tile.perlin && tile.level == 0) return "Height: Perlin Generated";
+        return String.format("Height: %d", (tile.height / -8));
     }
 
-    public void updateObjInspector() {
-        Platform.runLater(() -> {
-            if (selectedTile != null) {
-                objPositionLabel.setText(String.format("Position: X=%d, Z=%d Level=%d",
-                        selectedTile.x,
-                        selectedTile.z,
-                        selectedTile.level));
-                List<ObjData> currentObjs = currentMapData.getObjData(selectedTile.level, selectedTile.x,selectedTile.z);
+    private String formatTileFlag(TileData tile) {
+        return "Flag ID: " + (tile.flag != null ? tile.flag : "None");
+    }
 
-                StringBuilder details = new StringBuilder();
-                details.append(String.format("--------------------%n"));
-                if (!currentObjs.isEmpty()) {
-                    for (int i = 0; i < currentObjs.size(); i++) {
-                        ObjData obj = currentObjs.get(i);
-                        details.append(String.format("Name: %s%nCount: %d%nID: %d%n", FileLoader.getObjMap().get(obj.id), obj.count, obj.id));
-                        if (i < currentObjs.size() - 1) {
-                            details.append(String.format("--------------------%n"));
-                        }
-                    }
-                } else {
-                    details.append("No ObjData found for this tile.");
-                }
-                objDetailsLabel.setText(details.toString());
+    private String formatTileShape(TileData tile) {
+        return "Shape ID: " + (tile.shape != null ? tile.shape : 0);
+    }
+
+    private String formatTileRotation(TileData tile) {
+        return "Shape Rotation: " + (tile.rotation != null ? tile.rotation * 90 : 0);
+    }
+
+    private String formatTileTexture(TileData tile) {
+        return "Texture Name: " + (tile.overlay != null && tile.overlay.texture != null
+                ? tile.overlay.texture : "None");
+    }
+
+    private String formatLocDetails(TileData tile) {
+        if (currentMapData == null) return "";
+        List<LocData> locs = currentMapData.getLocData(tile.level, tile.x, tile.z);
+        StringBuilder details = new StringBuilder();
+        details.append("--------------------\n");
+        if (!locs.isEmpty()) {
+            for (int i = 0; i < locs.size(); i++) {
+                LocData loc = locs.get(i);
+                details.append(String.format("Name: %s\nID: %d\nShape: %d\nRotation: %s\n",
+                        FileLoader.getLocMap().get(loc.id), loc.id, loc.shape, loc.rotation * 90));
+                if (i < locs.size() - 1) details.append("--------------------\n");
             }
-        });
+        } else {
+            details.append("No LocData found for this tile.");
+        }
+        return details.toString();
+    }
+
+    private String formatNpcDetails(TileData tile) {
+        if (currentMapData == null) return "";
+        List<NpcData> npcs = currentMapData.getNpcData(tile.level, tile.x, tile.z);
+        StringBuilder details = new StringBuilder();
+        details.append("--------------------\n");
+        if (!npcs.isEmpty()) {
+            for (int i = 0; i < npcs.size(); i++) {
+                NpcData npc = npcs.get(i);
+                details.append(String.format("Name: %s\nID: %d\n", FileLoader.getNpcMap().get(npc.id), npc.id));
+                if (i < npcs.size() - 1) details.append("--------------------\n");
+            }
+        } else {
+            details.append("No NpcData found for this tile.");
+        }
+        return details.toString();
+    }
+
+    private String formatObjDetails(TileData tile) {
+        if (currentMapData == null) return "";
+        List<ObjData> objs = currentMapData.getObjData(tile.level, tile.x, tile.z);
+        StringBuilder details = new StringBuilder();
+        details.append("--------------------\n");
+        if (!objs.isEmpty()) {
+            for (int i = 0; i < objs.size(); i++) {
+                ObjData obj = objs.get(i);
+                details.append(String.format("Name: %s\nCount: %d\nID: %d\n",
+                        FileLoader.getObjMap().get(obj.id), obj.count, obj.id));
+                if (i < objs.size() - 1) details.append("--------------------\n");
+            }
+        } else {
+            details.append("No ObjData found for this tile.");
+        }
+        return details.toString();
+    }
+
+    private void notifyTileSelected() {
+        if (selectedTile == null) {
+            notifyTileCleared();
+            return;
+        }
+        TileData tile = selectedTile;
+        String pos = formatTilePosition(tile);
+        String locInfo = formatLocDetails(tile);
+        String npcInfo = formatNpcDetails(tile);
+        String objInfo = formatObjDetails(tile);
+
+        if (configUI != null) {
+            configUI.updateTileDisplay(pos,
+                    formatTileOverlay(tile), formatTileUnderlay(tile),
+                    formatTileHeight(tile), formatTileFlag(tile),
+                    formatTileShape(tile), formatTileRotation(tile),
+                    formatTileTexture(tile));
+            configUI.updateLocDisplay(pos, locInfo);
+            configUI.updateNpcDisplay(pos, npcInfo);
+            configUI.updateObjDisplay(pos, objInfo);
+        }
+
+        if (ipcServer != null && ipcServer.isConnected()) {
+            String overlayId = tile.overlay != null ? String.valueOf(tile.overlay.id) : "none";
+            String overlayName = tile.overlay != null
+                    ? (FileLoader.getFloMap().get(tile.overlay.id) != null ? FileLoader.getFloMap().get(tile.overlay.id) : "none")
+                    : "none";
+            String underlayId = tile.underlay != null ? String.valueOf(tile.underlay.id) : "none";
+            String underlayName = tile.underlay != null
+                    ? (FileLoader.getFloMap().get(tile.underlay.id) != null ? FileLoader.getFloMap().get(tile.underlay.id) : "none")
+                    : "none";
+            String height = String.valueOf(tile.height);
+            String perlin = String.valueOf(tile.perlin && tile.level == 0);
+            String flag = tile.flag != null ? String.valueOf(tile.flag) : "none";
+            String shape = tile.shape != null ? String.valueOf(tile.shape) : "none";
+            String rotation = tile.rotation != null ? String.valueOf(tile.rotation) : "none";
+            String texture = (tile.overlay != null && tile.overlay.texture != null)
+                    ? tile.overlay.texture : "none";
+
+            ipcServer.sendEvent(String.join(IpcProtocol.SEP,
+                    IpcProtocol.TILE,
+                    String.valueOf(tile.x), String.valueOf(tile.z), String.valueOf(tile.level),
+                    overlayId, overlayName, underlayId, underlayName,
+                    height, perlin, flag, shape, rotation, texture,
+                    IpcProtocol.escape(locInfo), IpcProtocol.escape(npcInfo), IpcProtocol.escape(objInfo)));
+        }
+    }
+
+    private void notifyTileCleared() {
+        if (configUI != null) {
+            configUI.clearInspectors();
+        }
+        if (ipcServer != null && ipcServer.isConnected()) {
+            ipcServer.sendEvent(IpcProtocol.TILE_CLEAR);
+        }
     }
 
     public void run() {
-        // JavaFX/Swing must not run on the main thread when using -XstartOnFirstThread (macOS).
-        // Run the config UI on a separate thread so the main thread is reserved for GLFW only.
-        CountDownLatch uiReady = new CountDownLatch(1);
-        Thread uiThread = new Thread(() -> {
+        if (!ipcMode && !isMac()) {
             try {
-                SwingUtilities.invokeAndWait(this::setupJavaFXUI);
+                SwingUtilities.invokeAndWait(() -> {
+                    configUI = new ConfigUI(serverDirectoryPath, createDirectController());
+                    configUI.show();
+                    fxAvailable = true;
+                });
             } catch (Exception e) {
                 System.err.println("Failed to create config UI: " + e.getMessage());
-            } finally {
-                uiReady.countDown();
+                e.printStackTrace();
             }
-        }, "JavaFX-Config-UI");
-        uiThread.start();
-        try {
-            uiReady.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted waiting for UI", e);
         }
 
         init();
-
-        // Position config frame and GLFW window side-by-side. GLFW calls must run on main thread.
-        Platform.runLater(() -> {
-            JFrame frame = (JFrame) SwingUtilities.getWindowAncestor(fxPanel);
-            if (frame != null) {
-                Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
-                int screenHeight = screenSize.height;
-                int frameX = 0;
-                int frameY = (screenHeight - frame.getHeight()) / 2;
-                frame.setLocation(frameX, frameY);
-                int windowHeight = 600;
-                int windowX = frameX + frame.getWidth();
-                int windowY = (screenHeight - windowHeight) / 2;
-                final int x = windowX;
-                final int y = windowY + 10;
-                enqueueGLTask(() -> glfwSetWindowPos(window, x, y));
-            }
-        });
-
         enableTextureRendering();
         setupVertexDataWithTriangles(triangleList);
+
+        if (ipcMode && ipcPort > 0) {
+            startIpcServer();
+        }
+
+        if (fxAvailable && configUI != null) {
+            try {
+                java.awt.Dimension screenSize = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
+                JFrame frame = configUI.getFrame();
+                if (frame != null) {
+                    int screenHeight = screenSize.height;
+                    int frameX = 0;
+                    int frameY = (screenHeight - frame.getHeight()) / 2;
+                    frame.setLocation(frameX, frameY);
+                    int windowHeight = 600;
+                    int windowX = frameX + frame.getWidth();
+                    int windowY = (screenHeight - windowHeight) / 2;
+                    final int wx = windowX;
+                    final int wy = windowY + 10;
+                    enqueueGLTask(() -> glfwSetWindowPos(window, wx, wy));
+                }
+            } catch (Exception ignored) {}
+        }
+
         loop();
 
         glfwFreeCallbacks(window);
         glfwDestroyWindow(window);
         glfwTerminate();
-        glfwSetErrorCallback(null).free();
+        GLFWErrorCallback cb = glfwSetErrorCallback(null);
+        if (cb != null) cb.free();
     }
 
     private void init() {
@@ -1262,9 +512,7 @@ public class OpenGLRenderer {
             }
 
             if ((mods & GLFW_MOD_CONTROL) != 0 && key == GLFW_KEY_Z && action == GLFW_RELEASE) {
-                Platform.runLater(() -> {
-                    performUndo();
-                });
+                performUndo();
             }
 
             if ((mods & GLFW_MOD_CONTROL) != 0) {
@@ -1272,20 +520,14 @@ public class OpenGLRenderer {
                     copyTileDataToMemory();
                 } else if (key == GLFW_KEY_V && action == GLFW_RELEASE) {
                     saveStateBeforeChange();
-                    Platform.runLater(() -> {
-                        pasteTileDataFromMemory();
-                        updateTileInspector();
-                        updateLocInspector();
-                        updateNpcInspector();
-                        updateObjInspector();
-                    });
+                    pasteTileDataFromMemory();
+                    notifyTileSelected();
                 }
             }
         });
 
 
         glfwSetCursorPosCallback(window, (window, xpos, ypos) -> {
-
             if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
                 if (firstMouse) {
                     lastX = (float) xpos;
@@ -1316,208 +558,7 @@ public class OpenGLRenderer {
                 }
             }
             if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
-                double[] xpos = new double[1];
-                double[] ypos = new double[1];
-                glfwGetCursorPos(window, xpos, ypos);
-
-                int mouseX = (int) xpos[0];
-                int mouseY = (int) ypos[0];
-
-                boolean ctrlPressed = (mods & GLFW_MOD_CONTROL) != 0;
-                boolean OPressed = glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS;
-                boolean LPressed = glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS;
-                boolean NPressed = glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS;
-                newTriangle clickedTriangle = pickTriangle(mouseX, mouseY);
-
-                if (clickedTriangle != null) {
-                    int tileX = clickedTriangle.tileData.tileX;
-                    int tileZ = clickedTriangle.tileData.tileZ;
-
-                    TileData tile;
-                    tile = currentMapData.mapTiles[currentLevel][tileX][tileZ];
-                    if(tile == null)
-                        tile = new TileData(currentLevel, tileX, tileZ);
-                    selectedTile = tile;
-                } else {
-                    Vector2i tileCoords = pickTile(mouseX, mouseY);
-
-                    if (tileCoords != null) {
-                        int tileX = tileCoords.x;
-                        int tileZ = tileCoords.y;
-                        TileData tile;
-                        tile = currentMapData.mapTiles[currentLevel][tileX][tileZ];
-                        if(tile == null)
-                            tile = new TileData(currentLevel, tileX, tileZ);
-                        selectedTile = tile;
-                    } else {
-                        selectedTile = null;
-                    }
-                }
-                Platform.runLater(() -> {
-                    updateTileInspector();
-                    updateLocInspector();
-                    updateNpcInspector();
-                    updateObjInspector();
-                });
-
-                if (ctrlPressed) {
-                    if (selectedTile != null) {
-                        saveStateBeforeChange();
-                        TileData newTile = new TileData(selectedTile.level, selectedTile.x, selectedTile.z);
-
-                        if (selectedOverlayID == null || selectedOverlayID == -1) {
-                            newTile.overlay = null;
-                        } else if (selectedOverlayID == 0) {
-                            newTile.overlay = selectedTile.overlay;
-                        } else {
-                            newTile.overlay = new OverlayData(selectedOverlayID);
-                        }
-                        if (selectedUnderlayID == null || selectedUnderlayID == -1) {
-                            newTile.underlay = null;
-                        } else if (selectedUnderlayID == 0) {
-                            newTile.underlay = selectedTile.underlay;
-                        } else {
-                            newTile.underlay = new UnderlayData(selectedUnderlayID);
-                        }
-                        if (newHeightTextField.getText() != null && !newHeightTextField.getText().isEmpty()) {
-                            try {
-                                double newHeight = Double.parseDouble(newHeightTextField.getText());
-                                if(newHeight == 0 && currentLevel == 0) {
-                                    int baseX = 0;
-                                    int baseY = 0;
-                                    Pattern fileNamePattern = Pattern.compile("m(\\d+)_(\\d+)\\.jm2");
-                                    Matcher fileNameMatcher = fileNamePattern.matcher(currentMapFileName);
-                                    if (fileNameMatcher.find()) {
-                                        baseX = Integer.parseInt(fileNameMatcher.group(1));
-                                        baseY = Integer.parseInt(fileNameMatcher.group(2));
-                                    }
-                                    int worldX = newTile.x + baseX + 932731;
-                                    int worldZ = newTile.z + baseY + 556238;
-                                    newTile.perlin = true;
-                                    newTile.height = World.perlinNoise(worldX, worldZ) * -8;
-                                } else {
-                                    newTile.height = (int) Math.floor(newHeight) * -8;
-                                }
-                            } catch (NumberFormatException e) {
-                                System.err.println("Invalid height value: " + newHeightTextField.getText());
-                            }
-                        } else {
-                            if (selectedTile.perlin)
-                                newTile.perlin = true;
-                            newTile.height = selectedTile.height;
-                        }
-                        if (newTile.overlay != null) {
-                            if (selectedRotation == -1) {
-                                newTile.rotation = selectedTile.rotation;
-                            } else if (selectedRotation == 0) {
-                                newTile.rotation = null;
-                            } else if (selectedRotation == 90) {
-                                newTile.rotation = 1;
-                            } else if (selectedRotation == 180) {
-                                newTile.rotation = 2;
-                            } else if (selectedRotation == 270) {
-                                newTile.rotation = 3;
-                            }
-                            if (selectedShape == -1) {
-                                newTile.shape = selectedTile.shape;
-                            } else {
-                                newTile.shape = selectedShape;
-                            }
-                            if (selectedFlag == -1) {
-                                newTile.flag = selectedTile.flag;
-                            } else {
-                                newTile.flag = selectedFlag;
-                            }
-                        }
-                        currentMapData.mapTiles[selectedTile.level][selectedTile.x][selectedTile.z] = newTile;
-                        Platform.runLater(() -> {
-                            drawNewMap(currentMapData);
-                            selectedTile = newTile;
-                            updateTileInspector();
-                            updateLocInspector();
-                            updateNpcInspector();
-                            updateObjInspector();
-                        });
-                    }
-                }
-
-                if (LPressed) {
-                    if (selectedTile != null) {
-                        String selectedLocName = modelViewerSelector.getSelectedModel();
-                        if (selectedLocName != null) {
-                            int locId = -1;
-                            for (Integer id : FileLoader.getLocMap().keySet()) {
-                                if (FileLoader.getLocMap().get(id).equals(selectedLocName)) {
-                                    locId = id;
-                                    break;
-                                }
-                            }
-                            if(locId == -1) {
-                                System.out.println("Couldn't find Loc ID for Loc: " + selectedLocName);
-                                return;
-                            }
-                            for (LocData Loc : currentMapData.getLocData(selectedTile.level, selectedTile.x, selectedTile.z)) {
-                                if (Loc.shape == selectedLocShape) {
-                                    System.out.println("Tile already contains Loc with Locshape: " + selectedLocShape);
-                                    return;
-                                }
-                            }
-                            saveStateBeforeChange();
-                            LocData newLoc = new LocData(selectedTile.level, selectedTile.x, selectedTile.z, locId, selectedLocShape);
-                            newLoc.rotation = selectedLocRotation / 90;
-                            currentMapData.locations.add(newLoc);
-                            Platform.runLater(() -> {
-                                drawNewMap(currentMapData);
-                                updateLocInspector();
-                            });
-                        } else {
-                            System.err.println("No model selected in Model Viewer.");
-                        }
-                    }
-                }
-
-                if (NPressed) {
-                    if (selectedTile != null) {
-                        if (selectedNpcId != -1) {
-                            saveStateBeforeChange();
-                            NpcData newNpc = new NpcData(selectedTile.level, selectedTile.x, selectedTile.z, selectedNpcId);
-                            currentMapData.npcs.add(newNpc);
-                            Platform.runLater(() -> {
-                                drawNewMap(currentMapData);
-                                updateNpcInspector();
-                            });
-                        } else {
-                            System.err.println("No NPC selected.");
-                        }
-                    }
-                }
-
-                if (OPressed) {
-                    if (selectedTile != null) {
-                        if (selectedObjId != -1) {
-                            int objAmount = 1;
-                            if (objAmountTextField.getText() != null && !objAmountTextField.getText().isEmpty()) {
-                                try {
-                                    objAmount = Integer.parseInt(objAmountTextField.getText());
-                                } catch (NumberFormatException e) {
-                                    System.err.println("Invalid object amount: " + objAmountTextField.getText());
-                                }
-                            }
-                            if (objAmount < 1) {
-                                objAmount = 1;
-                            }
-                            saveStateBeforeChange();
-                            ObjData newObj = new ObjData(selectedTile.level, selectedTile.x, selectedTile.z, selectedObjId, objAmount);
-                            currentMapData.objects.add(newObj);
-                            Platform.runLater(() -> {
-                                drawNewMap(currentMapData);
-                                updateObjInspector();
-                            });
-                        } else {
-                            System.err.println("No OBJ selected.");
-                        }
-                    }
-                }
+                handleLeftClick(mods);
             }
         });
         try (MemoryStack stack = stackPush()) {
@@ -1541,6 +582,192 @@ public class OpenGLRenderer {
         glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
         camera = new Camera(new Vector3f(4400.0f, -7000.0f, 4000.0f));
         setupShaders();
+    }
+
+    private void handleLeftClick(int mods) {
+        double[] xpos = new double[1];
+        double[] ypos = new double[1];
+        glfwGetCursorPos(window, xpos, ypos);
+
+        int mouseX = (int) xpos[0];
+        int mouseY = (int) ypos[0];
+
+        boolean ctrlPressed = (mods & GLFW_MOD_CONTROL) != 0;
+        boolean OPressed = glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS;
+        boolean LPressed = glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS;
+        boolean NPressed = glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS;
+        newTriangle clickedTriangle = pickTriangle(mouseX, mouseY);
+
+        if (clickedTriangle != null) {
+            int tileX = clickedTriangle.tileData.tileX;
+            int tileZ = clickedTriangle.tileData.tileZ;
+
+            TileData tile = currentMapData.mapTiles[currentLevel][tileX][tileZ];
+            if (tile == null)
+                tile = new TileData(currentLevel, tileX, tileZ);
+            selectedTile = tile;
+        } else {
+            Vector2i tileCoords = pickTile(mouseX, mouseY);
+
+            if (tileCoords != null) {
+                int tileX = tileCoords.x;
+                int tileZ = tileCoords.y;
+                TileData tile = currentMapData.mapTiles[currentLevel][tileX][tileZ];
+                if (tile == null)
+                    tile = new TileData(currentLevel, tileX, tileZ);
+                selectedTile = tile;
+            } else {
+                selectedTile = null;
+            }
+        }
+
+        notifyTileSelected();
+
+        if (ctrlPressed && selectedTile != null) {
+            handleCtrlClick();
+        }
+
+        if (LPressed && selectedTile != null) {
+            handleLocPlace();
+        }
+
+        if (NPressed && selectedTile != null) {
+            handleNpcPlace();
+        }
+
+        if (OPressed && selectedTile != null) {
+            handleObjPlace();
+        }
+    }
+
+    private void handleCtrlClick() {
+        saveStateBeforeChange();
+        TileData newTile = new TileData(selectedTile.level, selectedTile.x, selectedTile.z);
+
+        if (selectedOverlayID == null || selectedOverlayID == -1) {
+            newTile.overlay = null;
+        } else if (selectedOverlayID == 0) {
+            newTile.overlay = selectedTile.overlay;
+        } else {
+            newTile.overlay = new OverlayData(selectedOverlayID);
+        }
+        if (selectedUnderlayID == null || selectedUnderlayID == -1) {
+            newTile.underlay = null;
+        } else if (selectedUnderlayID == 0) {
+            newTile.underlay = selectedTile.underlay;
+        } else {
+            newTile.underlay = new UnderlayData(selectedUnderlayID);
+        }
+        if (heightText != null && !heightText.isEmpty()) {
+            try {
+                double newHeight = Double.parseDouble(heightText);
+                if (newHeight == 0 && currentLevel == 0) {
+                    int baseX = 0;
+                    int baseY = 0;
+                    Pattern fileNamePattern = Pattern.compile("m(\\d+)_(\\d+)\\.jm2");
+                    Matcher fileNameMatcher = fileNamePattern.matcher(currentMapFileName);
+                    if (fileNameMatcher.find()) {
+                        baseX = Integer.parseInt(fileNameMatcher.group(1));
+                        baseY = Integer.parseInt(fileNameMatcher.group(2));
+                    }
+                    int worldX = newTile.x + baseX + 932731;
+                    int worldZ = newTile.z + baseY + 556238;
+                    newTile.perlin = true;
+                    newTile.height = World.perlinNoise(worldX, worldZ) * -8;
+                } else {
+                    newTile.height = (int) Math.floor(newHeight) * -8;
+                }
+            } catch (NumberFormatException e) {
+                System.err.println("Invalid height value: " + heightText);
+            }
+        } else {
+            if (selectedTile.perlin)
+                newTile.perlin = true;
+            newTile.height = selectedTile.height;
+        }
+        if (newTile.overlay != null) {
+            if (selectedRotation == -1) {
+                newTile.rotation = selectedTile.rotation;
+            } else if (selectedRotation == 0) {
+                newTile.rotation = null;
+            } else if (selectedRotation == 90) {
+                newTile.rotation = 1;
+            } else if (selectedRotation == 180) {
+                newTile.rotation = 2;
+            } else if (selectedRotation == 270) {
+                newTile.rotation = 3;
+            }
+            if (selectedShape == -1) {
+                newTile.shape = selectedTile.shape;
+            } else {
+                newTile.shape = selectedShape;
+            }
+            if (selectedFlag == -1) {
+                newTile.flag = selectedTile.flag;
+            } else {
+                newTile.flag = selectedFlag;
+            }
+        }
+        currentMapData.mapTiles[selectedTile.level][selectedTile.x][selectedTile.z] = newTile;
+        drawNewMap(currentMapData);
+        selectedTile = newTile;
+        notifyTileSelected();
+    }
+
+    private void handleLocPlace() {
+        String locName = selectedLocName;
+        if (locName == null) {
+            System.err.println("No model selected.");
+            return;
+        }
+        int locId = -1;
+        for (Integer id : FileLoader.getLocMap().keySet()) {
+            if (FileLoader.getLocMap().get(id).equals(locName)) {
+                locId = id;
+                break;
+            }
+        }
+        if (locId == -1) {
+            System.out.println("Couldn't find Loc ID for Loc: " + locName);
+            return;
+        }
+        for (LocData loc : currentMapData.getLocData(selectedTile.level, selectedTile.x, selectedTile.z)) {
+            if (loc.shape == selectedLocShape) {
+                System.out.println("Tile already contains Loc with Locshape: " + selectedLocShape);
+                return;
+            }
+        }
+        saveStateBeforeChange();
+        LocData newLoc = new LocData(selectedTile.level, selectedTile.x, selectedTile.z, locId, selectedLocShape);
+        newLoc.rotation = selectedLocRotation / 90;
+        currentMapData.locations.add(newLoc);
+        drawNewMap(currentMapData);
+        notifyTileSelected();
+    }
+
+    private void handleNpcPlace() {
+        if (selectedNpcId == -1) {
+            System.err.println("No NPC selected.");
+            return;
+        }
+        saveStateBeforeChange();
+        NpcData newNpc = new NpcData(selectedTile.level, selectedTile.x, selectedTile.z, selectedNpcId);
+        currentMapData.npcs.add(newNpc);
+        drawNewMap(currentMapData);
+        notifyTileSelected();
+    }
+
+    private void handleObjPlace() {
+        if (selectedObjId == -1) {
+            System.err.println("No OBJ selected.");
+            return;
+        }
+        int amount = Math.max(1, selectedObjAmount);
+        saveStateBeforeChange();
+        ObjData newObj = new ObjData(selectedTile.level, selectedTile.x, selectedTile.z, selectedObjId, amount);
+        currentMapData.objects.add(newObj);
+        drawNewMap(currentMapData);
+        notifyTileSelected();
     }
 
     private void loop() {
@@ -1615,7 +842,7 @@ public class OpenGLRenderer {
                     continue;
                 }
 
-                Integer openglTexId = TextureLoader.textureIdMap.get(triangleTexId);
+                Integer openglTexId = org.lostcitymapeditor.Loaders.TextureLoader.textureIdMap.get(triangleTexId);
                 if (openglTexId == null) {
                     System.err.println("No OpenGL texture ID found for triangle texture ID: " + triangleTexId);
                     continue;
@@ -1647,8 +874,234 @@ public class OpenGLRenderer {
         glDeleteProgram(shaderProgram);
     }
 
+    // --- IPC server ---
+
+    private void startIpcServer() {
+        ipcServer = new IpcServer(ipcPort, (cmd, args) -> {
+            switch (cmd) {
+                case IpcProtocol.SET_MAP -> {
+                    if (args.length > 0) {
+                        currentMapFileName = args[0];
+                        currentMapData = MapDataTransformer.parseJM2File(
+                                serverDirectoryPath + "/maps/" + currentMapFileName);
+                        historyStack.clear();
+                        selectedTile = null;
+                        drawNewMap(currentMapData);
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_LEVEL -> {
+                    if (args.length > 0) {
+                        currentLevel = Integer.parseInt(args[0]);
+                        historyStack.clear();
+                        if (currentMapData != null) drawMapLevel();
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_OVERLAY -> {
+                    if (args.length > 0) selectedOverlayID = Integer.parseInt(args[0]);
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_UNDERLAY -> {
+                    if (args.length > 0) selectedUnderlayID = Integer.parseInt(args[0]);
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_SHAPE -> {
+                    if (args.length > 0) selectedShape = Integer.parseInt(args[0]);
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_FLAG -> {
+                    if (args.length > 0) selectedFlag = Integer.parseInt(args[0]);
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_ROTATION -> {
+                    if (args.length > 0) selectedRotation = Integer.parseInt(args[0]);
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_HEIGHT -> {
+                    heightText = (args.length > 0) ? IpcProtocol.unescape(args[0]) : "";
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_LOC -> {
+                    if (args.length >= 3) {
+                        selectedLocName = args[0];
+                        selectedLocShape = Integer.parseInt(args[1]);
+                        selectedLocRotation = Integer.parseInt(args[2]);
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_NPC -> {
+                    if (args.length > 0) selectedNpcId = Integer.parseInt(args[0]);
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_OBJ -> {
+                    if (args.length >= 2) {
+                        selectedObjId = Integer.parseInt(args[0]);
+                        selectedObjAmount = Integer.parseInt(args[1]);
+                    } else if (args.length == 1) {
+                        selectedObjId = Integer.parseInt(args[0]);
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.SET_DISPLAY -> {
+                    if (args.length >= 3) {
+                        displayLocs = "1".equals(args[0]);
+                        displayNpcs = "1".equals(args[1]);
+                        displayObjs = "1".equals(args[2]);
+                        if (currentMapData != null) drawNewMap(currentMapData);
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.CLEAR_LOCS -> {
+                    if (selectedTile != null && currentMapData != null) {
+                        saveStateBeforeChange();
+                        currentMapData.removeLocData(selectedTile.level, selectedTile.x, selectedTile.z);
+                        drawNewMap(currentMapData);
+                        notifyTileSelected();
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.CLEAR_NPCS -> {
+                    if (selectedTile != null && currentMapData != null) {
+                        saveStateBeforeChange();
+                        currentMapData.removeNpcData(selectedTile.level, selectedTile.x, selectedTile.z);
+                        drawNewMap(currentMapData);
+                        notifyTileSelected();
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.CLEAR_OBJS -> {
+                    if (selectedTile != null && currentMapData != null) {
+                        saveStateBeforeChange();
+                        currentMapData.removeObjData(selectedTile.level, selectedTile.x, selectedTile.z);
+                        drawNewMap(currentMapData);
+                        notifyTileSelected();
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.EXPORT -> {
+                    if (args.length > 0 && currentMapData != null) {
+                        MapDataTransformer.writeJM2File(currentMapData, args[0]);
+                    }
+                    return IpcProtocol.OK;
+                }
+                case IpcProtocol.PING -> {
+                    return IpcProtocol.OK;
+                }
+                default -> {
+                    return IpcProtocol.ERR + IpcProtocol.SEP + "Unknown command: " + cmd;
+                }
+            }
+        });
+        ipcServer.start();
+    }
+
+    // --- Direct EditorController for combined mode ---
+
+    private EditorController createDirectController() {
+        return new EditorController() {
+            @Override
+            public void setMap(String filename) {
+                currentMapFileName = filename;
+                currentMapData = MapDataTransformer.parseJM2File(
+                        serverDirectoryPath + "/maps/" + filename);
+                historyStack.clear();
+                selectedTile = null;
+                drawNewMap(currentMapData);
+                notifyTileCleared();
+            }
+
+            @Override
+            public void setLevel(int level) {
+                currentLevel = level;
+                historyStack.clear();
+                if (currentMapData != null) drawMapLevel();
+            }
+
+            @Override
+            public void setOverlay(int id) { selectedOverlayID = id; }
+
+            @Override
+            public void setUnderlay(int id) { selectedUnderlayID = id; }
+
+            @Override
+            public void setShape(int id) { selectedShape = id; }
+
+            @Override
+            public void setFlag(int id) { selectedFlag = id; }
+
+            @Override
+            public void setRotation(int degrees) { selectedRotation = degrees; }
+
+            @Override
+            public void setHeight(String text) { heightText = text != null ? text : ""; }
+
+            @Override
+            public void setLoc(String name, int shape, int rotation) {
+                selectedLocName = name;
+                selectedLocShape = shape;
+                selectedLocRotation = rotation;
+            }
+
+            @Override
+            public void setNpc(int id) { selectedNpcId = id; }
+
+            @Override
+            public void setObj(int id, int amount) {
+                selectedObjId = id;
+                selectedObjAmount = amount;
+            }
+
+            @Override
+            public void setDisplay(boolean locs, boolean npcs, boolean objs) {
+                displayLocs = locs;
+                displayNpcs = npcs;
+                displayObjs = objs;
+                if (currentMapData != null) drawNewMap(currentMapData);
+            }
+
+            @Override
+            public void clearLocs() {
+                if (selectedTile != null && currentMapData != null) {
+                    saveStateBeforeChange();
+                    currentMapData.removeLocData(selectedTile.level, selectedTile.x, selectedTile.z);
+                    drawNewMap(currentMapData);
+                    notifyTileSelected();
+                }
+            }
+
+            @Override
+            public void clearNpcs() {
+                if (selectedTile != null && currentMapData != null) {
+                    saveStateBeforeChange();
+                    currentMapData.removeNpcData(selectedTile.level, selectedTile.x, selectedTile.z);
+                    drawNewMap(currentMapData);
+                    notifyTileSelected();
+                }
+            }
+
+            @Override
+            public void clearObjs() {
+                if (selectedTile != null && currentMapData != null) {
+                    saveStateBeforeChange();
+                    currentMapData.removeObjData(selectedTile.level, selectedTile.x, selectedTile.z);
+                    drawNewMap(currentMapData);
+                    notifyTileSelected();
+                }
+            }
+
+            @Override
+            public void exportMap(String absolutePath) {
+                if (currentMapData != null) {
+                    MapDataTransformer.writeJM2File(currentMapData, absolutePath);
+                }
+            }
+        };
+    }
+
+    // --- Startup methods ---
+
     public static void startRender() throws IOException {
-        // Allow server directory via -Dserver.dir=... or first program argument (when chooser doesn't show on macOS)
         serverDirectoryPath = System.getProperty("server.dir");
         if (serverDirectoryPath == null || serverDirectoryPath.isEmpty()) {
             String[] args = LostCityMapEditor.getLaunchArgs();
@@ -1666,16 +1119,25 @@ public class OpenGLRenderer {
             System.err.println("No server directory selected. Exiting. Use -Dserver.dir=/path or: ./gradlew run --args=\"/path/to/server\"");
             return;
         }
-        FileLoader.loadFiles(serverDirectoryPath);
+        loadDataAndCreateRenderer(serverDirectoryPath, -1, false);
+    }
+
+    public static void startRenderOnly(String serverPath, int port) throws IOException {
+        serverDirectoryPath = serverPath;
+        loadDataAndCreateRenderer(serverPath, port, true);
+    }
+
+    private static void loadDataAndCreateRenderer(String serverPath, int port, boolean rendererOnly) throws IOException {
+        FileLoader.loadFiles(serverPath);
         underlayMap = FileLoader.getUnderlayMap();
         overlayMap = FileLoader.getOverlayMap();
         shapeImages = FileLoader.getShapeImages();
         npcMap = FileLoader.getAllNpcMap();
         objMap = FileLoader.getAllObjMap();
 
-        currentMapData = MapDataTransformer.parseJM2File(serverDirectoryPath + "/maps/" + currentMapFileName);
+        currentMapData = MapDataTransformer.parseJM2File(serverPath + "/maps/" + currentMapFileName);
 
-        Pix3D.loadTextures(serverDirectoryPath);
+        Pix3D.loadTextures(serverPath);
         Pix3D.setBrightness(0.8);
         Pix3D.initPool(20);
         Pix3D.init3D(800, 600);
@@ -1699,6 +1161,8 @@ public class OpenGLRenderer {
         List<newTriangle> triangleList = getTriangles();
 
         renderer = new OpenGLRenderer();
+        renderer.ipcMode = rendererOnly;
+        renderer.ipcPort = port;
         renderer.setTriangles(triangleList);
         renderer.run();
     }
@@ -1759,16 +1223,6 @@ public class OpenGLRenderer {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
 
-    private Integer findOverlayOrUnderlayIdByName(String name) {
-        for (Map.Entry<Integer, String> entry : FileLoader.getFloMap().entrySet()) {
-            if (entry.getValue().equals(name)) {
-                return entry.getKey();
-            }
-        }
-        System.err.println("No ID found for name: " + name);
-        return null;
-    }
-
     private Vector2i pickTile(int mouseX, int mouseY) {
         float x = (2.0f * mouseX) / 800 - 1.0f;
         float y = 1.0f - (2.0f * mouseY) / 600;
@@ -1822,15 +1276,10 @@ public class OpenGLRenderer {
         }
     }
 
-    private static boolean isMac() {
+    static boolean isMac() {
         return System.getProperty("os.name", "").toLowerCase().contains("mac");
     }
 
-    /**
-     * On macOS the main app runs with -XstartOnFirstThread (for GLFW), so Swing/JavaFX dialogs
-     * cannot open. Spawn a separate JVM without that flag to show the directory chooser; it
-     * prints the selected path to stdout and we read it here.
-     */
     private static String chooseServerDirectoryViaSubprocess() {
         String scriptPath = System.getProperty("server.chooser.script");
         if (scriptPath != null && !scriptPath.isEmpty()) {
@@ -1881,18 +1330,18 @@ public class OpenGLRenderer {
         final String[] resultPath = new String[1];
         try {
             SwingUtilities.invokeAndWait(() -> {
-                JFileChooser fileChooser = new JFileChooser();
+                javax.swing.JFileChooser fileChooser = new javax.swing.JFileChooser();
                 fileChooser.setDialogTitle("Select Server Data Source Directory");
-                fileChooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+                fileChooser.setFileSelectionMode(javax.swing.JFileChooser.DIRECTORIES_ONLY);
 
-                JOptionPane.showMessageDialog(null,
+                javax.swing.JOptionPane.showMessageDialog(null,
                         "Please select the root directory containing your server's 'pack' and 'maps' folders.",
                         "Directory Selection",
-                        JOptionPane.INFORMATION_MESSAGE);
+                        javax.swing.JOptionPane.INFORMATION_MESSAGE);
 
                 int result = fileChooser.showDialog(null, "Select Directory");
 
-                if (result == JFileChooser.APPROVE_OPTION) {
+                if (result == javax.swing.JFileChooser.APPROVE_OPTION) {
                     resultPath[0] = fileChooser.getSelectedFile().getAbsolutePath();
                 } else {
                     resultPath[0] = null;
@@ -1990,10 +1439,10 @@ public class OpenGLRenderer {
         currentMapData = historyStack.pop();
         drawNewMap(currentMapData);
         selectedTile = null;
-        updateTileInspector();
-        updateLocInspector();
-        updateNpcInspector();
-        updateObjInspector();
+        notifyTileCleared();
     }
 
+    public static String getServerDirectoryPath() {
+        return serverDirectoryPath;
+    }
 }

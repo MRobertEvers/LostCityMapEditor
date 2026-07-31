@@ -76,11 +76,8 @@ application.applicationDefaultJvmArgs.addAll([
     "-Djava.library.path=${lwjglNativesPath}",
     "-Dorg.lwjgl.librarypath=${lwjglNativesPath}"
 ])
-// macOS: GLFW requires -XstartOnFirstThread or the process crashes (exit 133).
-// The directory chooser is run in a subprocess so it can open without this flag.
-if (osName.contains("mac")) {
-    application.applicationDefaultJvmArgs.add("-XstartOnFirstThread")
-}
+// macOS dual-process: the launcher spawns the renderer child with -XstartOnFirstThread.
+// Do NOT add it to applicationDefaultJvmArgs — the launcher JVM must NOT have it.
 
 // Script for macOS directory chooser subprocess (no -XstartOnFirstThread so the dialog can open)
 def chooserScript = file("${buildDir}/chooser.sh")
@@ -109,7 +106,7 @@ tasks.named('run').configure {
 }
 
 javafx {
-    version = '21'
+    version = '21.0.7'
     modules = ['javafx.controls', 'javafx.swing']
 }
 
