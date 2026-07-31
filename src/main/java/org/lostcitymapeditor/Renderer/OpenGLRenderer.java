@@ -21,6 +21,7 @@ import javafx.scene.shape.Rectangle;
 import org.joml.*;
 import org.lostcitymapeditor.DataObjects.*;
 import org.lostcitymapeditor.OriginalCode.*;
+import org.lostcitymapeditor.LostCityMapEditor;
 import org.lostcitymapeditor.Loaders.FileLoader;
 import org.lostcitymapeditor.Loaders.MapDataLoader;
 import org.lostcitymapeditor.Loaders.TextureLoader;
@@ -30,8 +31,11 @@ import org.lwjgl.BufferUtils;
 import org.lwjgl.glfw.*;
 
 import java.awt.*;
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.lang.Math;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 import static org.lostcitymapeditor.DataObjects.newTriangle.getTriangles;
@@ -47,6 +51,7 @@ import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -123,7 +128,7 @@ public class OpenGLRenderer {
     private Set<Integer> hoveredTileTriangleIndices = new HashSet<>();
     private final TextureManager textureManager = new TextureManager();
     private VertexDataHandler vertexDataHandler = new VertexDataHandler();
-    private final ModelViewer modelViewer = new ModelViewer(300, 350);
+    private ModelViewer modelViewer;
     private ModelViewerSelector modelViewerSelector;
     private int selectedRotation = -1;
     private int selectedLocRotation;
@@ -312,12 +317,20 @@ public class OpenGLRenderer {
     }
 
     public void setupJavaFXUI() {
+        modelViewer = new ModelViewer(300, 350);
         JFrame frame = new JFrame("LostCity Map Editor Config");
         fxPanel = new JFXPanel();
         frame.add(fxPanel);
         frame.setSize(1100, 900);
+        frame.setAlwaysOnTop(true);
         frame.setVisible(true);
+        frame.toFront();
+        frame.requestFocus();
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        // Stop always-on-top after a short delay so the window can be moved behind others
+        javax.swing.Timer t = new javax.swing.Timer(500, e -> frame.setAlwaysOnTop(false));
+        t.setRepeats(false);
+        t.start();
 
         Platform.runLater(() -> {
             ObservableList<String> mapFiles = MapDataLoader.getJM2Files(serverDirectoryPath + "/maps/");
@@ -1175,8 +1188,29 @@ public class OpenGLRenderer {
     }
 
     public void run() {
-        setupJavaFXUI();
+        // JavaFX/Swing must not run on the main thread when using -XstartOnFirstThread (macOS).
+        // Run the config UI on a separate thread so the main thread is reserved for GLFW only.
+        CountDownLatch uiReady = new CountDownLatch(1);
+        Thread uiThread = new Thread(() -> {
+            try {
+                SwingUtilities.invokeAndWait(this::setupJavaFXUI);
+            } catch (Exception e) {
+                System.err.println("Failed to create config UI: " + e.getMessage());
+            } finally {
+                uiReady.countDown();
+            }
+        }, "JavaFX-Config-UI");
+        uiThread.start();
+        try {
+            uiReady.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted waiting for UI", e);
+        }
+
         init();
+
+        // Position config frame and GLFW window side-by-side. GLFW calls must run on main thread.
         Platform.runLater(() -> {
             JFrame frame = (JFrame) SwingUtilities.getWindowAncestor(fxPanel);
             if (frame != null) {
@@ -1188,9 +1222,12 @@ public class OpenGLRenderer {
                 int windowHeight = 600;
                 int windowX = frameX + frame.getWidth();
                 int windowY = (screenHeight - windowHeight) / 2;
-                glfwSetWindowPos(window, windowX, windowY + 10);
+                final int x = windowX;
+                final int y = windowY + 10;
+                enqueueGLTask(() -> glfwSetWindowPos(window, x, y));
             }
         });
+
         enableTextureRendering();
         setupVertexDataWithTriangles(triangleList);
         loop();
@@ -1497,6 +1534,7 @@ public class OpenGLRenderer {
         glfwMakeContextCurrent(window);
         glfwSwapInterval(1);
         glfwShowWindow(window);
+        glfwFocusWindow(window);
         GL.createCapabilities();
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
@@ -1610,9 +1648,22 @@ public class OpenGLRenderer {
     }
 
     public static void startRender() throws IOException {
-        serverDirectoryPath = chooseServerDirectory();
-        if (serverDirectoryPath == null) {
-            System.err.println("No server directory selected. Exiting.");
+        // Allow server directory via -Dserver.dir=... or first program argument (when chooser doesn't show on macOS)
+        serverDirectoryPath = System.getProperty("server.dir");
+        if (serverDirectoryPath == null || serverDirectoryPath.isEmpty()) {
+            String[] args = LostCityMapEditor.getLaunchArgs();
+            if (args != null && args.length > 0 && args[0] != null && !args[0].isEmpty()) {
+                serverDirectoryPath = args[0];
+            }
+        }
+        if (serverDirectoryPath == null || serverDirectoryPath.isEmpty()) {
+            serverDirectoryPath = chooseServerDirectory();
+            if ((serverDirectoryPath == null || serverDirectoryPath.isEmpty()) && isMac()) {
+                serverDirectoryPath = chooseServerDirectoryViaSubprocess();
+            }
+        }
+        if (serverDirectoryPath == null || serverDirectoryPath.isEmpty()) {
+            System.err.println("No server directory selected. Exiting. Use -Dserver.dir=/path or: ./gradlew run --args=\"/path/to/server\"");
             return;
         }
         FileLoader.loadFiles(serverDirectoryPath);
@@ -1771,23 +1822,87 @@ public class OpenGLRenderer {
         }
     }
 
+    private static boolean isMac() {
+        return System.getProperty("os.name", "").toLowerCase().contains("mac");
+    }
+
+    /**
+     * On macOS the main app runs with -XstartOnFirstThread (for GLFW), so Swing/JavaFX dialogs
+     * cannot open. Spawn a separate JVM without that flag to show the directory chooser; it
+     * prints the selected path to stdout and we read it here.
+     */
+    private static String chooseServerDirectoryViaSubprocess() {
+        String scriptPath = System.getProperty("server.chooser.script");
+        if (scriptPath != null && !scriptPath.isEmpty()) {
+            try {
+                ProcessBuilder pb = new ProcessBuilder("sh", scriptPath);
+                pb.redirectErrorStream(false);
+                Process p = pb.start();
+                String path;
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                    path = reader.readLine();
+                }
+                if (p.waitFor() == 0 && path != null && !path.isEmpty()) {
+                    return path;
+                }
+            } catch (Exception e) {
+                System.err.println("Could not run directory chooser script: " + e.getMessage());
+            }
+        }
+        String cp = System.getProperty("java.class.path");
+        if (cp != null && !cp.isEmpty()) {
+            String javaBin = System.getProperty("java.home") + "/bin/java";
+            try {
+                ProcessBuilder pb = new ProcessBuilder(
+                    javaBin,
+                    "-cp", cp,
+                    "org.lostcitymapeditor.DirectoryChooserMain"
+                );
+                pb.redirectErrorStream(false);
+                Process p = pb.start();
+                String path;
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                    path = reader.readLine();
+                }
+                if (p.waitFor() == 0 && path != null && !path.isEmpty()) {
+                    return path;
+                }
+            } catch (Exception e) {
+                System.err.println("Could not run directory chooser: " + e.getMessage());
+            }
+        }
+        System.err.println("On macOS, provide the server path: ./gradlew run --args=\"/path/to/server\" or -Dserver.dir=/path");
+        return null;
+    }
+
     public static String chooseServerDirectory() {
-        JFileChooser fileChooser = new JFileChooser();
-        fileChooser.setDialogTitle("Select Server Data Source Directory");
-        fileChooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        final String[] resultPath = new String[1];
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                JFileChooser fileChooser = new JFileChooser();
+                fileChooser.setDialogTitle("Select Server Data Source Directory");
+                fileChooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
 
-        JOptionPane.showMessageDialog(null,
-                "Please select the root directory containing your server's 'models', 'sprites', 'fonts', etc. folders (e.g., '../Server/data/src/').",
-                "Directory Selection",
-                JOptionPane.INFORMATION_MESSAGE);
+                JOptionPane.showMessageDialog(null,
+                        "Please select the root directory containing your server's 'pack' and 'maps' folders.",
+                        "Directory Selection",
+                        JOptionPane.INFORMATION_MESSAGE);
 
-        int result = fileChooser.showDialog(null, "Select Directory");
+                int result = fileChooser.showDialog(null, "Select Directory");
 
-        if (result == JFileChooser.APPROVE_OPTION) {
-            return fileChooser.getSelectedFile().getAbsolutePath();
-        } else {
+                if (result == JFileChooser.APPROVE_OPTION) {
+                    resultPath[0] = fileChooser.getSelectedFile().getAbsolutePath();
+                } else {
+                    resultPath[0] = null;
+                }
+            });
+        } catch (Exception e) {
+            System.err.println("Failed to show directory chooser: " + e.getMessage());
             return null;
         }
+        return resultPath[0];
     }
 
     private void copyTileDataToMemory() {

@@ -43,6 +43,71 @@ application {
     ]
 }
 
+// Extract only the current platform's LWJGL natives (avoids x86_64 on arm64 Mac)
+def lwjglNativesDir = layout.buildDirectory.dir('lwjgl-natives')
+def osArch = System.getProperty("os.arch", "").toLowerCase()
+def osName = System.getProperty("os.name", "").toLowerCase()
+def isMacArm64 = osName.contains("mac") && (osArch == "aarch64" || osArch == "arm64")
+def nativesFilter = { File f ->
+    if (!f.name.contains("natives") || !f.name.contains("lwjgl")) return false
+    if (osName.contains("mac")) return isMacArm64 ? f.name.contains("natives-macos-arm64") : (f.name.contains("natives-macos") && !f.name.contains("arm64"))
+    if (osName.contains("win")) return f.name.contains("natives-windows")
+    if (osName.contains("linux")) return f.name.contains("natives-linux")
+    return true
+}
+task extractLwjglNatives(type: Copy) {
+    doFirst {
+        def dir = file("${buildDir}/lwjgl-natives")
+        if (dir.exists()) dir.deleteDir()
+    }
+    from {
+        configurations.runtimeClasspath.filter(nativesFilter).collect { zipTree(it) }
+    }
+    into lwjglNativesDir
+    include '**/*.dylib', '**/*.so', '**/*.dll'
+    eachFile { details ->
+        details.path = details.name
+    }
+    includeEmptyDirs = false
+}
+
+def lwjglNativesPath = file("${buildDir}/lwjgl-natives").absolutePath
+application.applicationDefaultJvmArgs.addAll([
+    "-Djava.library.path=${lwjglNativesPath}",
+    "-Dorg.lwjgl.librarypath=${lwjglNativesPath}"
+])
+// macOS: GLFW requires -XstartOnFirstThread or the process crashes (exit 133).
+// The directory chooser is run in a subprocess so it can open without this flag.
+if (osName.contains("mac")) {
+    application.applicationDefaultJvmArgs.add("-XstartOnFirstThread")
+}
+
+// Script for macOS directory chooser subprocess (no -XstartOnFirstThread so the dialog can open)
+def chooserScript = file("${buildDir}/chooser.sh")
+task createChooserScript {
+    doLast {
+        chooserScript.parentFile.mkdirs()
+        def cp = configurations.runtimeClasspath.asPath.replace('"', '\\"')
+        def javaHome = System.getProperty('java.home').replace('"', '\\"')
+        chooserScript.text = "#!/bin/sh\nCP=\"${cp}\"\nJAVA_HOME=\"${javaHome}\"\nexec \"\${JAVA_HOME}/bin/java\" -cp \"\$CP\" org.lostcitymapeditor.DirectoryChooserMain\n"
+        chooserScript.setExecutable(true)
+    }
+}
+
+// Ensure run uses full runtime classpath and LWJGL natives.
+// Pass -Dserver.dir=... from command line to set server data path without the chooser.
+tasks.named('run').configure {
+    dependsOn extractLwjglNatives, createChooserScript
+    classpath = sourceSets.main.runtimeClasspath
+    modularity.inferModulePath.set(true)
+    if (System.getProperty('server.dir') != null) {
+        systemProperty 'server.dir', System.getProperty('server.dir')
+    }
+    if (osName.contains("mac")) {
+        systemProperty 'server.chooser.script', chooserScript.absolutePath
+    }
+}
+
 javafx {
     version = '21'
     modules = ['javafx.controls', 'javafx.swing']
@@ -52,6 +117,7 @@ project.ext.lwjglVersion = "3.3.6"
 project.ext.lwjglNativesWindows = "natives-windows"
 project.ext.lwjglNativesLinux = "natives-linux"
 project.ext.lwjglNativesMac = "natives-macos"
+project.ext.lwjglNativesMacArm64 = "natives-macos-arm64"
 
 repositories {
     mavenCentral()
@@ -75,6 +141,10 @@ dependencies {
     runtimeOnly "org.lwjgl:lwjgl::$lwjglNativesMac"
     runtimeOnly "org.lwjgl:lwjgl-glfw::$lwjglNativesMac"
     runtimeOnly "org.lwjgl:lwjgl-opengl::$lwjglNativesMac"
+
+    runtimeOnly "org.lwjgl:lwjgl::$lwjglNativesMacArm64"
+    runtimeOnly "org.lwjgl:lwjgl-glfw::$lwjglNativesMacArm64"
+    runtimeOnly "org.lwjgl:lwjgl-opengl::$lwjglNativesMacArm64"
 }
 
 test {
