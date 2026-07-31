@@ -56,32 +56,26 @@ public class Camera {
         float velocity = movementSpeed * deltaTime;
 
         /*
-            Map-editor UX change retained:
-              - FORWARD/BACKWARD/LEFT/RIGHT are projected onto the "horizontal plane"
-                (plane perpendicular to worldUp), so WASD pans instead of unintentionally
-                moving vertically when pitch is steep.
+            Map-editor UX: WASD pans on the XZ ground plane using yaw only.
+            Projecting `front` onto the plane fails when looking straight down
+            (default pitch ≈ 90°), which zeroed W/S while A/D still worked.
          */
-
-        // Project front onto plane perpendicular to worldUp.
-        Vector3f forwardFlat = new Vector3f(front);
-        float frontDotUp = forwardFlat.dot(worldUp);
-        forwardFlat.fma(-frontDotUp, worldUp); // forwardFlat -= (frontDotUp * worldUp)
-
+        Vector3f forwardFlat = new Vector3f(
+                (float) Math.cos(Math.toRadians(yaw)),
+                0.0f,
+                (float) Math.sin(Math.toRadians(yaw))
+        );
         if (forwardFlat.lengthSquared() > 1e-8f) {
             forwardFlat.normalize();
         } else {
-            forwardFlat.set(0.0f, 0.0f, 0.0f);
+            forwardFlat.set(0.0f, 0.0f, 1.0f);
         }
 
-        // Project right onto plane perpendicular to worldUp.
-        Vector3f rightFlat = new Vector3f(right);
-        float rightDotUp = rightFlat.dot(worldUp);
-        rightFlat.fma(-rightDotUp, worldUp); // rightFlat -= (rightDotUp * worldUp)
-
+        Vector3f rightFlat = new Vector3f(forwardFlat).cross(worldUp);
         if (rightFlat.lengthSquared() > 1e-8f) {
             rightFlat.normalize();
         } else {
-            rightFlat.set(0.0f, 0.0f, 0.0f);
+            rightFlat.set(1.0f, 0.0f, 0.0f);
         }
 
         if (direction == CameraMovement.FORWARD)
